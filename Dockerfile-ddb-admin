@@ -1,0 +1,5 @@
+FROM node:17
+RUN npm install -g dynamodb-admin
+
+EXPOSE 8001
+ENTRYPOINT /usr/local/bin/dynamodb-admin

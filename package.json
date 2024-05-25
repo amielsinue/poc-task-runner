@@ -1,0 +1,18 @@
+{
+  "scripts": {
+    "build": "esbuild --bundle --minify --platform=node --target=node12 --outdir=build index.js",
+    "export": "cd build && zip main.js.zip index.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.15.11",
+    "serverless-dynamodb-local": "^0.2.40",
+    "serverless-localstack": "^1.0.1",
+    "serverless-step-functions": "^3.11.1"
+  },
+  "dependencies": {
+    "@influxdata/influxdb-client": "^1.32.0",
+    "node-fetch": "^1.7.3",
+    "request": "^2.88.2",
+    "ulid": "^2.3.0"
+  }
+}

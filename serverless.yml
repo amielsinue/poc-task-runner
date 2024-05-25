@@ -1,0 +1,535 @@
+service: task-runner
+plugins:
+  - serverless-localstack
+  - serverless-step-functions
+custom:
+  stage: ${opt.stage, 'dev'}
+  localstack:
+    host: http://localhost
+    debug: true
+    stages:
+      - local
+      - dev
+    endpointFile: localstack_endpoints.json
+  addTaskFunctionName: task-runner-${self:provider.stage}-addTask
+  runTaskFunctionName: task-runner-${self:provider.stage}-runTask
+  pullFirstTaskFunctionName: task-runner-${self:provider.stage}-pullFirstTask
+  pullQueuedTasksByUserIdFunctionName: task-runner-${self:provider.stage}-pullQueuedTasksByUserId
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+  region: us-west-1
+  stage: ${opt:stage, 'dev'}
+  environment:
+    DYNAMODB_LOCK_TABLE: ${self:service}-${opt:stage, self:provider.stage}-locks
+    DYNAMODB_TASKS_TABLE: ${self:service}-${opt:stage, self:provider.stage}-tasks
+    AWS_REGION: ${self:provider.region}
+    AWS_ACCOUNT_ID: bar
+    AWS_DEFAULT_REGION: ${self:provider.region}
+    AWS_ACCESS_KEY_ID: 123
+    AWS_SECRET_ACCESS_KEY: ABC
+    LAMBDA_ENDPOINT: http://host.docker.internal:3001
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "states:*"
+      Resource:
+        - "*"
+    - Effect: "Allow"
+      Action:
+        - dynamodb:Query
+        - dynamodb:Scan
+        - dynamodb:GetItem
+        - dynamodb:PutItem
+        - dynamodb:UpdateItem
+        - dynamodb:DeleteItem
+      Resource:
+        - "arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.DYNAMODB_LOCK_TABLE}"
+        - "arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.DYNAMODB_TASKS_TABLE}"
+
+functions:
+  addTask:
+    handler: index.addTask
+    url: true
+    events:
+      - http:
+          path: '/tasks'
+          method: post
+  runTask:
+    handler: index.runTask
+    url: true
+    events:
+      - http:
+          path: '/run'
+          method: post
+  pullQueuedTasksByUserId:
+    handler: index.pullQueuedTasksByUserId
+    url: true
+    events:
+      - http:
+          path: '/tasks'
+          method: post
+  pullFirstTask:
+    handler: index.pullFirstTask
+    url: true
+    events:
+      - http:
+          path: '/task'
+          method: get
+
+stepFunctions:
+  stateMachines:
+    userTasksStateMachine:
+      name: userTasksStateMachine
+      definition:
+        StartAt: "GetLock"
+        States:
+          GetLock:
+            Type: Parallel
+            Branches:
+              - StartAt: AcquireLock
+                States:
+                  AcquireLock:
+                    Type: Task
+                    Resource: "arn:aws:states:::dynamodb:updateItem"
+                    Parameters:
+                      TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+                      Key:
+                        lockName:
+                          "S": "$.input.user_id"
+                      ExpressionAttributeNames:
+                        "#currentlockcount": "currentLockCount"
+                        "#lockownerid.$": "$$.Execution.Id"
+                      ExpressionAttributeValues:
+                        ":increase":
+                          "N": "1"
+                        ":limit":
+                          "N": "1"
+                        ":lockAcquiredTime":
+                          "S.$": "$$.State.EnteredTime"
+                      UpdateExpression: "SET #currentlockcount = #currentlockcount + :increase, #lockownerid = :lockAcquiredTime"
+                      ConditionExpression: "currentLockCount <> :limit and attribute_not_exists(#lockownerid)"
+                      ReturnValues: UPDATED_NEW
+                    Retry:
+                      - ErrorEquals:
+                          - Dynamodb.AmazonDynamoDBException
+                        MaxAttempts: 0
+                      - ErrorEquals:
+                          - States.ALL
+                        MaxAttempts: 6
+                        BackoffRate: 2
+                    Catch:
+                      - ErrorEquals:
+                          - Dynamodb.AmazonDynamoDBException
+                        Next: InitializeLockItem
+                        ResultPath: "$.lockinfo.acquisitionerror"
+                      - ErrorEquals:
+                          - DynamoDB.ConditionalCheckFailedException
+                        Next: GetCurrentLockRecord
+                        ResultPath: "$.lockinfo.acquisitionerror"
+                    End: True
+                  InitializeLockItem:
+                    Type: Task
+                    Resource: "arn:aws:states:::dynamodb:putItem"
+                    Parameters:
+                      TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+                      Item:
+                        lockName:
+                          "S": "$.input.user_id"
+                        currentLockCount:
+                          "N": 0
+                      ExpressionAttributeValues:
+                        ":lockname":
+                          "S": "$.input.user_id"
+                      ConditionExpression: "lockName <> :lockname"
+                    Catch:
+                      - ErrorEquals:
+                          - States.ALL
+                        Next: AcquireLock
+                        ResultPath: null
+                    Next: AcquireLock
+                    ResultPath: null
+                  GetCurrentLockRecord:
+                    Type: Task
+                    Resource: "arn:aws:states:::dynamodb:getItem"
+                    Parameters:
+                      TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+                      ExpressionAttributeNames:
+                        "#lockownerid.$": "$$.Execution.Id"
+                      Key:
+                        lockName:
+                          "S": "$.input.user_id"
+                      ProjectionExpression: "#lockownerid"
+                    ResultSelector:
+                      "Item.$": "$.Item"
+                      "ITemString.$": States.JsonToString($.Item)
+                    ResultPath: "$.lockinfo.currentlockitem"
+                    Next: CheckIfLockAlreadyAcquired
+                  CheckIfLockAlreadyAcquired:
+                    Type: Choice
+                    Choices:
+                      - And:
+                          - Variable: "$.lockinfo.currentlockitem.ItemString"
+                            IsPresent: true
+                          - Variable: "$.lockinfo.currentlockitem.ItemString"
+                            StringMatches: "*Z*"
+                        Next: ContinueBecauseLockWasAlreadyAcquired
+                    Default: "WaitToGetLock"
+                  ContinueBecauseLockWasAlreadyAcquired:
+                    Type: Pass
+                    End: true
+                  WaitToGetLock:
+                    Type: Wait
+                    Seconds: 3
+                    Next: AcquireLock
+            ResultPath: null
+            Next: PendingToRunning
+          PendingToRunning:
+            Type: Task
+            Resource: "arn:aws:states:::dynamodb:updateItem"
+            Parameters:
+              TableName: ${self:provider.environment.DYNAMODB_TASKS_TABLE}
+              Key:
+                user_id: "$.input.user_id"
+              ExpressionAttributeNames:
+                "#status": "status"
+              ExpressionAttributeValues:
+                ":pending_status": "0"
+                ":queued_status": "1"
+              UpdateExpression: "SET #status = :queued_status"
+              ConditionExpression: "status = 0"
+            Next: PullQueuedTasks
+          PullQueuedTasks:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ pullQueuedTasksByUserId, Arn ]
+            Parameters:
+              "user_id.$": "$.input.user_id"
+            ResultPath: "$.tasks"
+            Next: "ValidateTasksNotEmpty"
+          ValidateTasksNotEmpty:
+            Type: Choice
+            Choices:
+              - Variable: "$.tasks"
+                IsPresent: true
+                Next: RunUserTasks
+            Default: ReleaseLock
+          RunUserTasks:
+            Type: Map
+            InputPath: "$.tasks"
+            MaxConcurrency: 1
+            Parameters:
+              "task.$": "$$.Map.Item.Value"
+            Iterator:
+              StartAt: "RunTask"
+              States:
+                RunTask:
+                  Type: Task
+                  Resource:
+                    Fn::GetAtt: [ runTask, Arn ]
+                  Catch:
+                    - ErrorEquals:
+                        - States.ALL
+                      Next: UpdateTaskErrored
+                  Next: UpdateSucceeded
+                UpdateSucceeded:
+                  Type: Task
+                  Resource: arn:aws:states:::dynamodb:updateItem
+                  Parameters:
+                    TableName: ${self:provider.environment.DYNAMODB_TASKS_TABLE}
+                    Key:
+                      user_id:
+                        "S.$": "$.task.user_id"
+                      task_id:
+                        "S.$": "$.task.task_id"
+                    UpdateExpression: "SET #status = :status"
+                    ExpressionAttributeNames:
+                      "#status": "status"
+                    ExpressionAttributeValues:
+                      ":status":
+                        "S": "3"
+                  Next: Done
+                UpdateTaskErrored:
+                  Type: Task
+                  Resource: arn:aws:states:::dynamodb:updateItem
+                  Parameters:
+                    TableName: ${self:provider.environment.DYNAMODB_TASKS_TABLE}
+                    Key:
+                      user_id:
+                        "S.$": "$.task.user_id"
+                      task_id:
+                        "S.$": "$.task.task_id"
+                    UpdateExpression: "SET #status = :status"
+                    ExpressionAttributeNames:
+                      "#status": "status"
+                    ExpressionAttributeValues:
+                      ":status":
+                        "S": "4"
+                  Next: Done
+                Done:
+                  Type: Pass
+                  End: true
+            Next: PullQueuedTasks
+          ReleaseLock:
+            Type: Task
+            Resource: "arn:aws:states:::dynamodb:updateItem"
+            Parameters:
+              TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+              Key:
+                lockName:
+                  "S": "$.input.user_id"
+              ExpressionAttributeNames:
+                "#currentlockcount": "currentLockCount"
+                "#lockownerid.$": "$$.Execution.Id"
+              ExpressionAttributeValues:
+                ":decrease":
+                  "N": 1
+              UpdateExpression: "SET #currentlockcount = #currentlockcount - :decrease REMOVE #lockownerid"
+              ConditionExpression: "attribute_exists(#lockownerid)"
+              ReturnValues: UPDATED_NEW
+            Retry:
+              - ErrorEquals:
+                  - DynamoDB.ConditionalCheckFailedException
+                MaxAttempts: 0
+              - ErrorEquals:
+                  - States.ALL
+                MaxAttempts: 5
+                BackoffRate: 1.5
+            Catch:
+              - ErrorEquals:
+                  - DynamoDB.ConditionalCheckFailedException
+                Next: Finish
+                ResultPath: null
+            ResultPath: null
+            Next: Finish
+          Finish:
+            Type: "Succeed"
+    orchestratorStateMachine:
+      name: orchestratorStateMachine
+      definition:
+        StartAt: "GetLock"
+        States:
+          GetLock:
+            Type: Parallel
+            Branches:
+              - StartAt: AcquireLock
+                States:
+                  AcquireLock:
+                    Type: Task
+                    Resource: "arn:aws:states:::dynamodb:updateItem"
+                    Parameters:
+                      TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+                      Key:
+                        lockName:
+                          "S": "orchestratorStateMachine"
+                      ExpressionAttributeNames:
+                        "#currentlockcount": "currentLockCount"
+                        "#lockownerid.$": "$$.Execution.Id"
+                      ExpressionAttributeValues:
+                        ":increase":
+                          "N": "1"
+                        ":limit":
+                          "N": "1"
+                        ":lockAcquiredTime":
+                          "S.$": "$$.State.EnteredTime"
+                      UpdateExpression: "SET #currentlockcount = #currentlockcount + :increase, #lockownerid = :lockAcquiredTime"
+                      ConditionExpression: "currentLockCount <> :limit and attribute_not_exists(#lockownerid)"
+                      ReturnValues: UPDATED_NEW
+                    Retry:
+                      - ErrorEquals:
+                          - Dynamodb.AmazonDynamoDBException
+                        MaxAttempts: 0
+                      - ErrorEquals:
+                          - States.ALL
+                        MaxAttempts: 6
+                        BackoffRate: 2
+                    Catch:
+                      - ErrorEquals:
+                          - Dynamodb.AmazonDynamoDBException
+                        Next: InitializeLockItem
+                        ResultPath: "$.lockinfo.acquisitionerror"
+                      - ErrorEquals:
+                          - DynamoDB.ConditionalCheckFailedException
+                        Next: GetCurrentLockRecord
+                        ResultPath: "$.lockinfo.acquisitionerror"
+                    End: True
+                  InitializeLockItem:
+                    Type: Task
+                    Resource: "arn:aws:states:::dynamodb:putItem"
+                    Parameters:
+                      TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+                      Item:
+                        lockName:
+                          "S": "orchestratorStateMachine"
+                        currentLockCount:
+                          "N": 0
+                      ExpressionAttributeValues:
+                        ":lockname":
+                          "S": "orchestratorStateMachine"
+                      ConditionExpression: "lockName <> :lockname"
+                    Catch:
+                      - ErrorEquals:
+                          - States.ALL
+                        Next: AcquireLock
+                        ResultPath: null
+                    Next: AcquireLock
+                    ResultPath: null
+                  GetCurrentLockRecord:
+                    Type: Task
+                    Resource: "arn:aws:states:::dynamodb:getItem"
+                    Parameters:
+                      TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+                      ExpressionAttributeNames:
+                        "#lockownerid.$": "$$.Execution.Id"
+                      Key:
+                        lockName:
+                          "S": orchestratorStateMachine
+                      ProjectionExpression: "#lockownerid"
+                    ResultSelector:
+                      "Item.$": "$.Item"
+                      "ITemString.$": States.JsonToString($.Item)
+                    ResultPath: "$.lockinfo.currentlockitem"
+                    Next: CheckIfLockAlreadyAcquired
+                  CheckIfLockAlreadyAcquired:
+                    Type: Choice
+                    Choices:
+                      - And:
+                          - Variable: "$.lockinfo.currentlockitem.ItemString"
+                            IsPresent: true
+                          - Variable: "$.lockinfo.currentlockitem.ItemString"
+                            StringMatches: "*Z*"
+                        Next: ContinueBecauseLockWasAlreadyAcquired
+                    Default: "WaitToGetLock"
+                  ContinueBecauseLockWasAlreadyAcquired:
+                    Type: Pass
+                    End: true
+                  WaitToGetLock:
+                    Type: Wait
+                    Seconds: 3
+                    Next: AcquireLock
+            ResultPath: null
+            Next: PopUser
+          WaitAWhile:
+            Type: Wait
+            Seconds: 10
+            Next: ReleaseLock
+          PopUser:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ pullFirstTask, Arn ]
+            ResultPath: "$.user"
+            Next: "ValidateTasksNotEmpty"
+          ValidateTasksNotEmpty:
+            Type: Choice
+            Choices:
+              - Variable: "$.user.user_id"
+                IsPresent: true
+                Next: RunUserTasks
+            Default: ReleaseLock
+          RunUserTasks:
+            Type: Task
+            Resource: arn:aws:states:::states:startExecution.sync:2
+            Parameters:
+              Input:
+                "user_id.$": "$.user.user_id"
+              StateMachineArn: !Ref UserTasksStateMachine
+            Next: WaitAWhile
+          ReleaseLock:
+            Type: Task
+            Resource: "arn:aws:states:::dynamodb:updateItem"
+            Parameters:
+              TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+              Key:
+                lockName:
+                  "S": orchestratorStateMachine
+              ExpressionAttributeNames:
+                "#currentlockcount": "currentLockCount"
+                "#lockownerid.$": "$$.Execution.Id"
+              ExpressionAttributeValues:
+                ":decrease":
+                  "N": 1
+              UpdateExpression: "SET #currentlockcount = #currentlockcount - :decrease REMOVE #lockownerid"
+              ConditionExpression: "attribute_exists(#lockownerid)"
+              ReturnValues: UPDATED_NEW
+            Retry:
+              - ErrorEquals:
+                  - DynamoDB.ConditionalCheckFailedException
+                MaxAttempts: 0
+              - ErrorEquals:
+                  - States.ALL
+                MaxAttempts: 5
+                BackoffRate: 1.5
+            Catch:
+              - ErrorEquals:
+                  - DynamoDB.ConditionalCheckFailedException
+                Next: Finish
+                ResultPath: null
+            ResultPath: null
+            Next: Finish
+          Finish:
+            Type: "Succeed"
+
+
+resources:
+  Outputs:
+    UserTasksStateMachine:
+      Description: "userTasksStateMachine Arn"
+      Value: {"Fn::GetAtt": ["userTasksStateMachine", 'Arn']}
+  Resources:
+    LocksDynamoDbTable:
+      Type: 'AWS::DynamoDB::Table'
+      DeletionPolicy: Retain
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: "lockName"
+            AttributeType: "S"
+        KeySchema:
+          - AttributeName: "lockName"
+            KeyType: "HASH"
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.DYNAMODB_LOCK_TABLE}
+
+    TasksDynamoDbTable:
+      Type: 'AWS::DynamoDB::Table'
+      DeletionPolicy: Retain
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: "user_id"
+            AttributeType: "S"
+          - AttributeName: "task_id"
+            AttributeType: "S"
+          - AttributeName: "status"
+            AttributeType: "N"
+          - AttributeName: "priority"
+            AttributeType: "N"
+        KeySchema:
+          - AttributeName: "user_id"
+            KeyType: "HASH"
+          - AttributeName: "task_id"
+            KeyType: "RANGE"
+        GlobalSecondaryIndexes:
+          - IndexName: 'StatusIndex'
+            KeySchema:
+              - AttributeName: "status"
+                KeyType: "HASH"
+              - AttributeName: "priority"
+                KeyType: "RANGE"
+            Projection:
+              ProjectionType: ALL
+          - IndexName: 'UserStatusStatusIndex'
+            KeySchema:
+              - AttributeName: "user_id"
+                KeyType: "HASH"
+              - AttributeName: "status"
+                KeyType: "RANGE"
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.DYNAMODB_TASKS_TABLE}
